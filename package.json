@@ -1,0 +1,16 @@
+{
+  "name": "boxed",
+  "version": "0.1.0",
+  "description": "Run coding-agent CLIs inside MXC sandboxes from stored per-program configs",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "boxed": "bin/boxed.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@microsoft/mxc-sdk": "1.0.0"
+  }
+}

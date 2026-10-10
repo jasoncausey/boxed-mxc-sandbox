@@ -1,0 +1,59 @@
+{
+  "version": "1.0.0",
+  "containment": "process",
+  "filesystem": {
+    "readwritePaths": [
+      "${CWD}",
+      "~/.claude",
+      "~/.claude.json"
+    ],
+    "readonlyPaths": [
+      "~/.local/bin",
+      "~/.local/share/claude",
+      "~/.gitconfig",
+      "~/.config/git",
+      "~/.claude/settings.json",
+      "~/.claude/settings.local.json",
+      "~/.claude/CLAUDE.md",
+      "~/.claude/hooks",
+      "~/.claude/commands",
+      "~/.claude/agents",
+      "~/.claude/skills"
+    ],
+    "deniedPaths": [
+      "~/.ssh",
+      "~/.aws",
+      "~/.gnupg"
+    ]
+  },
+  "network": {
+    "egress": {
+      "default": "allow"
+    }
+  },
+  "process": {
+    "env": [
+      "CLAUDE_CODE_TMPDIR=${TMPDIR}"
+    ]
+  },
+  "boxed": {
+    "command": "claude",
+    "darwin": {
+      "filesystem": {
+        "readonlyPaths": [
+          "/opt/homebrew"
+        ]
+      },
+      "seatbelt": {
+        "keychainAccess": true
+      }
+    },
+    "linux": {
+      "filesystem": {
+        "readonlyPaths": [
+          "/usr/local"
+        ]
+      }
+    }
+  }
+}
