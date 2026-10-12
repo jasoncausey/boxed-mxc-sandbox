@@ -91,12 +91,20 @@ MXC's `network.ingress.hostLoopback` opens every port on localhost or none, and 
 
 `boxed` starts an HTTP proxy on a free port on `127.0.0.1` before the program and passes its address to MXC as `runtimeConfig.networkProxy`. MXC then blocks every direct connection except to the proxy and sets `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` for the program. The proxy forwards anything off this machine. A destination on this machine, meaning loopback or any of its own interface addresses, is forwarded only on the ports in `loopbackPorts`, and refused with a 403 otherwise. `--debug` reports each refusal.
 
+`"external": "deny"` in `boxed.proxy` makes the proxy refuse everything off this machine as well, leaving only the listed local ports:
+
+```json
+"boxed": { "proxy": { "loopbackPorts": [11434], "external": "deny" } }
+```
+
+A hostname is then refused without being looked up, since the lookup would itself leave the machine. Only IP addresses and `localhost` names are accepted. The default is `"allow"`.
+
 - The proxy runs inside the `boxed` process, so it stops when `boxed` does, however that happens.
 - `network.egress.default` must be `deny` or absent (`boxed` sets it), and the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
 - Only traffic that honours the proxy variables gets through. A program that opens sockets directly, such as `ssh`, has no network.
 - The proxy does not chain to a proxy the host itself needs.
 
-See [`examples/opencode.json`](examples/opencode.json).
+See [`examples/opencode.json`](examples/opencode.json) and [`examples/opencode-locked.json`](examples/opencode-locked.json).
 
 ### Paths and variables
 

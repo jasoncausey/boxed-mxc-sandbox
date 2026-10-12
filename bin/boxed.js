@@ -241,12 +241,14 @@ function buildRequest(name, programArgs, flags, runDir) {
   }
   if (proxy !== undefined) {
     validate(file, isObject(proxy), '"boxed.proxy" must be an object');
-    const { loopbackPorts = [], ...unknownProxy } = proxy;
+    const { loopbackPorts = [], external = 'allow', ...unknownProxy } = proxy;
     validate(file, !Object.keys(unknownProxy).length,
       `unknown "boxed.proxy" keys: ${Object.keys(unknownProxy).join(', ')}`);
     validate(file, Array.isArray(loopbackPorts) &&
       loopbackPorts.every((port) => Number.isInteger(port) && port >= 1 && port <= 65535),
       '"boxed.proxy.loopbackPorts" must be an array of port numbers');
+    validate(file, external === 'allow' || external === 'deny',
+      '"boxed.proxy.external" must be "allow" or "deny"');
   }
 
   const platformOverride = { darwin, linux }[process.platform];
