@@ -61,6 +61,7 @@ A config is an [MXC request](https://github.com/microsoft/mxc/blob/main/docs/sch
 | `command` | Program to run. Defaults to `<name>`, or to the basename of the `--config` file without `.json`. |
 | `passEnv` | Host environment variables to pass through. Defaults to a short list: `PATH`, `HOME`, `TERM`, `LANG` and similar. |
 | `privateTmp` | Give the program its own temp directory and deny the shared ones (see below). Defaults to `true`. |
+| `proxy` | Route the program's network traffic through a filtering proxy that `boxed` runs (see below). Off unless set. |
 | `darwin`, `linux` | Request fragment merged in on that platform. Objects merge key by key, arrays concatenate, other values replace. |
 
 ### What boxed fills in
@@ -78,6 +79,24 @@ The shared temp directories (`/tmp`, `/var/tmp` and the host's own `$TMPDIR`) ar
 A program that hardcodes `/tmp` needs to be told where to write instead. For Claude Code that is `CLAUDE_CODE_TMPDIR`, which the example config sets.
 
 `"privateTmp": false` turns all of this off: `${TMPDIR}` is then the host temp directory and nothing is denied for you.
+
+### Proxy
+
+MXC's `network.ingress.hostLoopback` opens every port on localhost or none, and on macOS it also has to open inbound connections. `boxed.proxy` is for a program that needs one local service, such as a model server, and the internet:
+
+```json
+"network": { "egress": { "default": "deny" } },
+"boxed": { "proxy": { "loopbackPorts": [11434] } }
+```
+
+`boxed` starts an HTTP proxy on a free port on `127.0.0.1` before the program and passes its address to MXC as `runtimeConfig.networkProxy`. MXC then blocks every direct connection except to the proxy and sets `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` for the program. The proxy forwards anything off this machine. A destination on this machine, meaning loopback or any of its own interface addresses, is forwarded only on the ports in `loopbackPorts`, and refused with a 403 otherwise. `--debug` reports each refusal.
+
+- The proxy runs inside the `boxed` process, so it stops when `boxed` does, however that happens.
+- `network.egress.default` must be `deny` or absent (`boxed` sets it), and the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
+- Only traffic that honours the proxy variables gets through. A program that opens sockets directly, such as `ssh`, has no network.
+- The proxy does not chain to a proxy the host itself needs.
+
+See [`examples/opencode.json`](examples/opencode.json).
 
 ### Paths and variables
 

@@ -13,6 +13,9 @@
 //
 // Each run gets a private directory under $XDG_CACHE_HOME/boxed (else ~/.cache/boxed)
 // that holds the request handed to MXC and the program's TMPDIR; it is removed on exit.
+//
+// A config with "boxed.proxy" gets a filtering proxy for the length of the run. It lives
+// in this process, so it cannot outlive boxed however boxed exits.
 
 import { spawn } from 'node:child_process';
 import {
@@ -22,6 +25,8 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { startProxy } from '../lib/proxy.js';
 
 const DEFAULT_PASS_ENV = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM', 'TERM_PROGRAM',
@@ -225,7 +230,7 @@ function buildRequest(name, programArgs, flags, runDir) {
   validate(file, isObject(boxed), '"boxed" must be an object');
   const {
     command = name ?? path.basename(file, '.json'), passEnv = DEFAULT_PASS_ENV,
-    privateTmp = true, darwin, linux, ...unknown
+    privateTmp = true, proxy, darwin, linux, ...unknown
   } = boxed;
   if (Object.keys(unknown).length) die(`${file}: unknown "boxed" keys: ${Object.keys(unknown).join(', ')}`);
   validate(file, typeof command === 'string' && command !== '', '"boxed.command" must be a non-empty string');
@@ -233,6 +238,15 @@ function buildRequest(name, programArgs, flags, runDir) {
   validate(file, typeof privateTmp === 'boolean', '"boxed.privateTmp" must be true or false');
   for (const [key, value] of Object.entries({ darwin, linux })) {
     validate(file, value === undefined || isObject(value), `"boxed.${key}" must be an object`);
+  }
+  if (proxy !== undefined) {
+    validate(file, isObject(proxy), '"boxed.proxy" must be an object');
+    const { loopbackPorts = [], ...unknownProxy } = proxy;
+    validate(file, !Object.keys(unknownProxy).length,
+      `unknown "boxed.proxy" keys: ${Object.keys(unknownProxy).join(', ')}`);
+    validate(file, Array.isArray(loopbackPorts) &&
+      loopbackPorts.every((port) => Number.isInteger(port) && port >= 1 && port <= 65535),
+      '"boxed.proxy.loopbackPorts" must be an array of port numbers');
   }
 
   const platformOverride = { darwin, linux }[process.platform];
@@ -259,6 +273,19 @@ function buildRequest(name, programArgs, flags, runDir) {
   merged.containment ??= 'process';
   merged.process ??= {};
   merged.process.cwd ??= cwd;
+
+  if (proxy) {
+    // The proxy only filters what is sent through it, so any direct route the config
+    // opens would go around it.
+    const { egress, ingress } = merged.network ?? {};
+    validate(file, merged.runtimeConfig?.networkProxy === undefined,
+      '"boxed.proxy" sets runtimeConfig.networkProxy itself; remove it from the config');
+    validate(file, egress?.default !== 'allow' && !egress?.allow && !egress?.deny,
+      '"boxed.proxy" needs network.egress to be {"default": "deny"} or absent');
+    validate(file, ingress?.hostLoopback !== 'allow',
+      '"boxed.proxy" cannot be combined with network.ingress.hostLoopback "allow"');
+    merged.network = merge(merged.network ?? {}, { egress: { default: 'deny' } });
+  }
 
   const argv = programArgs.map(shellQuote).join(' ');
   merged.process.commandLine = merged.process.commandLine
@@ -344,17 +371,31 @@ function buildRequest(name, programArgs, flags, runDir) {
     }
   }
 
-  return merged;
+  return { request: merged, proxy };
 }
 
-function main() {
+async function main() {
   const { flags, name, programArgs } = parseArgs(process.argv.slice(2));
   const runDir = createRunDir();
-  const request = buildRequest(name, programArgs, flags, runDir);
+  const { request, proxy } = buildRequest(name, programArgs, flags, runDir);
+
+  let running;
+  if (proxy) {
+    try {
+      running = await startProxy({
+        ...proxy,
+        log: flags.debug ? (message) => console.error(`boxed: ${message}`) : undefined,
+      });
+    } catch (error) {
+      die(`cannot start the proxy: ${error.message}`);
+    }
+    request.runtimeConfig = { ...request.runtimeConfig, networkProxy: running.url };
+  }
   const json = JSON.stringify(request, null, 2);
 
   if (flags.printConfig) {
     console.log(json);
+    running?.close();
     return;
   }
 
