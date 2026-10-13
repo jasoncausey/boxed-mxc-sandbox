@@ -20,6 +20,8 @@ The first form loads `<name>.json` from the config directory. The second loads `
 | Option | Effect |
 | --- | --- |
 | `--config FILE` | Load `FILE` instead of a named config. |
+| `--allow-symlink PATH[:rw]` | Grant read access to the target of the symlink `PATH` for this run, or read-write access with `:rw` (see below). May be repeated. |
+| `--allow-port PORT` | Let the program reach `PORT` on this machine for this run (see [Proxy](#proxy)). May be repeated. |
 | `--print-config` | Print the resolved MXC request JSON and exit. |
 | `--dry-run` | Have MXC validate the request without running the program. |
 | `--debug` | Print the resolved request and enable MXC diagnostics. |
@@ -99,6 +101,14 @@ MXC's `network.ingress.hostLoopback` opens every port on localhost or none, and 
 
 A hostname is then refused without being looked up, since the lookup would itself leave the machine. Only IP addresses and `localhost` names are accepted. The default is `"allow"`.
 
+`--allow-port PORT` adds a port to `loopbackPorts` for one run:
+
+```
+boxed --allow-port 8080 --allow-port 5432 opencode
+```
+
+If the config has no `boxed.proxy`, the flag starts the proxy for that run and says so. `external` then follows the config's `network.egress.default`: `"allow"` if that is `"allow"`, otherwise `"deny"`. A config that sets `network.egress` rules cannot be used with the flag, and one that sets `hostLoopback: "allow"` already opens every local port, so the flag is ignored with a warning.
+
 - The proxy runs inside the `boxed` process, so it stops when `boxed` does, however that happens.
 - `network.egress.default` must be `deny` or absent (`boxed` sets it), and the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
 - Only traffic that honours the proxy variables gets through. A program that opens sockets directly, such as `ssh`, has no network.
@@ -111,11 +121,51 @@ See [`examples/opencode.json`](examples/opencode.json) and [`examples/opencode-l
 - `${CWD}`, `${HOME}` and `${TMPDIR}` expand in any string, and `${env:NAME}` expands to that host environment variable (empty if unset).
 - In `process.commandLine` each expanded value is shell-quoted, so write `cd ${CWD}`, not `cd "${CWD}"`.
 - A leading `~/` expands in `filesystem` path lists.
+- A `deniedPaths` entry that is a symlink is denied at the path it leads to as well.
 - Every `filesystem` path must be absolute once expanded. A relative path, an unknown `${NAME}` or an unset `${env:NAME}` is an error, so a mistyped `deniedPaths` entry cannot silently protect nothing.
 - `readonlyPaths` entries that do not exist are dropped, so one config can list locations for several machines. `--debug` reports each one skipped.
 - A missing `readonlyPaths` entry that sits inside a `readwritePaths` entry is kept on macOS, so the program cannot create it. On Linux it is dropped like the rest.
 - `readwritePaths` entries that do not exist are kept on macOS, so the program can create them on first run. On Linux they are dropped with a warning, because Bubblewrap cannot bind a path that is not there.
 - `boxed` refuses to run if a `readwritePaths` entry covers your home directory, which is what `${CWD}` does when you start it from `~`. It warns if one covers the config file or `boxed` itself.
+
+### Symlinks
+
+The sandbox checks the path a symlink resolves to, not the link. A symlink inside a granted directory therefore only works if its target is granted as well. Either list the target in the config, or name the link at launch:
+
+```
+boxed --allow-symlink data --allow-symlink out/:rw omp
+```
+
+- `PATH` is relative to the current directory. It can be the link itself or a path that goes through one, such as `data/2024/report.csv`, which grants only that file.
+- The target is granted read-only. Add `:rw` to make it writable, as in `out/:rw`. `:ro` spells out the default, which is the way to name a link that itself ends in `:rw`.
+- A target already covered by the config keeps the access it has there. In particular `:rw` does not make a `readonlyPaths` entry writable; `boxed` warns and leaves it read-only.
+- A writable target gets the same checks as `readwritePaths`: `boxed` warns if it contains the config file or `boxed` itself.
+- A path that does not exist or is not a symlink is skipped with a warning, so the same command line works in projects that lack the link.
+- `boxed` refuses a link whose target covers your home directory. `deniedPaths` still win over the grant.
+- Symlinks inside the target that lead somewhere else are not followed; name those too.
+- A target inside a `deniedPaths` entry or a shared temp directory is skipped with a warning.
+
+The link sits in a directory the program can write to, so the program could point it somewhere else and wait for your next run to grant that. `boxed` guards against this in three ways:
+
+- Every run prints where each link leads and what was granted, so a change is visible before the program starts.
+- On macOS the link itself is read-only inside the sandbox and cannot be removed, renamed or replaced. A link in a subdirectory is only protected this far: the directories above it can still be moved.
+- When the program exits, `boxed` compares the link and each directory on the way to it with how they were at launch. A link that was changed or removed is put back, and a link that appeared where there was none is removed, each with a warning. If the path leads somewhere new because of a link further along the chain, `boxed` warns and leaves it to you.
+
+The check at exit is the only one of the last two on Linux. A process that survives the clean-up described under [Leftover processes](#leftover-processes) is still sandboxed but can change a link after the check, so read the line printed at launch.
+
+After every run, with or without `--allow-symlink`, `boxed` also walks the writable paths from the config and lists symlinks created during the run that lead somewhere the program had no access to. The sandbox does not follow these, but a tool you run on the directory afterwards might. They are reported, not removed. `--dry-run` skips these checks.
+
+### Leftover processes
+
+When the program exits, `boxed` stops whatever it left running, such as a dev server or a `nohup` job, and says what it stopped. Each gets `SIGTERM`, then `SIGKILL` if it is still there two seconds later. This runs before the symlink checks, so nothing is left to undo them.
+
+Nothing ties an orphaned process to the run that started it, so `boxed` goes on three signs:
+
+- it descends from the program, as seen by checking the process list twice a second during the run;
+- it carries `BOXED_RUN_ID`, a variable `boxed` adds to the program's environment;
+- it is an orphan in `boxed`'s own process group that started during the run. This one applies only when `boxed` leads its group, as it does when started from an interactive shell.
+
+A process that sets out to avoid all three can: one that clears its environment, detaches at once and leaves the process group. Treat this as a clean-up, not a guarantee. `--dry-run` skips it.
 
 ### Notes on the Claude example
 

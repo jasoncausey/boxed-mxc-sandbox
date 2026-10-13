@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // boxed — run a program inside an MXC sandbox using a stored per-program config.
 //
-//   boxed [--debug] [--dry-run] [--print-config] <name> [program args...]
-//   boxed [--debug] [--dry-run] [--print-config] --config FILE [program args...]
+//   boxed [options] <name> [program args...]
+//   boxed [options] --config FILE [program args...]
+//
+// Options: --debug, --dry-run, --print-config, --allow-symlink PATH[:rw], --allow-port PORT.
 //
 // Configs live in $BOXED_CONFIG_DIR, else $XDG_CONFIG_HOME/boxed, else ~/.config/boxed,
 // one file per program: <name>.json. Each file is an MXC request JSON
@@ -10,21 +12,31 @@
 // "boxed" key that this wrapper consumes and strips before handing off to MXC.
 // --config FILE loads that file instead of looking <name> up in the config dir;
 // <name> is then omitted and the program defaults to FILE's basename.
+// --allow-symlink PATH grants read access to whatever the symlink PATH (relative to the
+// current directory) points at, for this run only. PATH:rw grants write access as well.
+// --allow-port PORT opens one more port on this machine through the proxy, for this run only.
 //
 // Each run gets a private directory under $XDG_CACHE_HOME/boxed (else ~/.cache/boxed)
 // that holds the request handed to MXC and the program's TMPDIR; it is removed on exit.
 //
+// When the program exits, boxed stops the processes it left running, puts back any
+// --allow-symlink link it changed, and reports symlinks it created that lead outside
+// the sandbox.
+//
 // A config with "boxed.proxy" gets a filtering proxy for the length of the run. It lives
 // in this process, so it cannot outlive boxed however boxed exits.
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync,
+  realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { startProxy } from '../lib/proxy.js';
 
@@ -41,7 +53,7 @@ function die(message, code = 2) {
 }
 
 function parseArgs(argv) {
-  const flags = { debug: false, dryRun: false, printConfig: false, config: null };
+  const flags = { debug: false, dryRun: false, printConfig: false, config: null, allowSymlinks: [], allowPorts: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const arg = argv[i];
@@ -53,6 +65,18 @@ function parseArgs(argv) {
       flags.config = argv[i];
     }
     else if (arg.startsWith('--config=')) flags.config = arg.slice('--config='.length);
+    else if (arg === '--allow-symlink') {
+      if (++i >= argv.length) die('--allow-symlink requires a path');
+      flags.allowSymlinks.push(argv[i]);
+    }
+    else if (arg.startsWith('--allow-symlink=')) flags.allowSymlinks.push(arg.slice('--allow-symlink='.length));
+    else if (arg === '--allow-port' || arg.startsWith('--allow-port=')) {
+      if (arg === '--allow-port' && ++i >= argv.length) die('--allow-port requires a port number');
+      const value = arg === '--allow-port' ? argv[i] : arg.slice('--allow-port='.length);
+      const port = /^\d+$/.test(value) ? Number(value) : NaN;
+      if (!(port >= 1 && port <= 65535)) die(`--allow-port: ${JSON.stringify(value)} is not a port number`);
+      flags.allowPorts.push(port);
+    }
     else if (arg === '-h' || arg === '--help') usage(0);
     else if (arg === '--') { i++; break; }
     else if (arg.startsWith('-')) {
@@ -63,6 +87,7 @@ function parseArgs(argv) {
     else break;
   }
   if (flags.config === '') die('--config requires a file path');
+  if (flags.allowSymlinks.some((arg) => /^(:(ro|rw))?$/.test(arg))) die('--allow-symlink requires a path');
   if (flags.config) return { flags, name: null, programArgs: argv.slice(i) };
   if (i >= argv.length) usage(2);
   return { flags, name: argv[i], programArgs: argv.slice(i + 1) };
@@ -70,8 +95,8 @@ function parseArgs(argv) {
 
 function usage(code) {
   const text = [
-    'Usage: boxed [--debug] [--dry-run] [--print-config] <name> [program args...]',
-    '       boxed [--debug] [--dry-run] [--print-config] --config FILE [program args...]',
+    'Usage: boxed [options] <name> [program args...]',
+    '       boxed [options] --config FILE [program args...]',
     '',
     `  <name>          loads ${path.join(configDir(), '<name>.json')}`,
     '  --debug         print the resolved request and enable MXC diagnostics (generated profile, etc.)',
@@ -79,6 +104,12 @@ function usage(code) {
     '  --print-config  print the resolved MXC request JSON and exit',
     '  --config FILE   load FILE instead of a named config; the program to run defaults to',
     '                  FILE\'s basename, and program args starting with "-" go after "--"',
+    '  --allow-symlink PATH[:rw]',
+    '                  grant read access to the target of the symlink PATH (relative to the',
+    '                  current directory), or read-write access with ":rw"; may be repeated',
+    '  --allow-port PORT',
+    '                  let the program reach PORT on this machine through the boxed proxy;',
+    '                  may be repeated',
   ].join('\n');
   (code === 0 ? console.log : console.error)(text);
   process.exit(code);
@@ -124,6 +155,188 @@ function merge(base, override) {
 
 function realOrSelf(p) {
   try { return realpathSync(p); } catch { return p; }
+}
+
+// What sits at p itself, without following it: "link:<target>", "other" or "absent".
+function linkState(p) {
+  try {
+    return lstatSync(p).isSymbolicLink() ? `link:${readlinkSync(p)}` : 'other';
+  } catch {
+    return 'absent';
+  }
+}
+
+// p and every directory between base and p, outermost first; just p if it is not under base.
+function pathsBelow(base, p) {
+  if (p === base || !isWithin(p, base)) return [p];
+  const out = [];
+  let current = base;
+  for (const part of path.relative(base, p).split(path.sep)) {
+    current = path.join(current, part);
+    out.push(current);
+  }
+  return out;
+}
+
+// The program can write to the directory an --allow-symlink link lives in, so it can
+// point the link somewhere else and wait for the next run to grant that. Anything it
+// changed along the link's path is put back, and a link that appeared where there was
+// none is removed.
+function restoreSymlinks(watched) {
+  const warn = (message) => console.error(`boxed: warning: ${message}`);
+  for (const { link, from, target, snapshot } of watched) {
+    for (const [p, before] of snapshot) {
+      const now = linkState(p);
+      if (now === before) continue;
+      const was = before.startsWith('link:') ? before.slice(5) : null;
+      const is = now.startsWith('link:') ? now.slice(5) : null;
+      if (is === null && (was === null || now === 'other')) {
+        if (was !== null) warn(`${p} was a symlink to ${was} and is now a file or directory; left as it is`);
+        continue;
+      }
+      try {
+        if (is !== null) unlinkSync(p);
+        if (was !== null) symlinkSync(was, p);
+        warn(`${p} ${is === null ? 'was removed' : `was made a symlink to ${is}`} during the run; ` +
+             (was === null ? 'removed it' : `restored it to ${was}`));
+      } catch (error) {
+        warn(`${p} ${is === null ? 'was removed' : `was made a symlink to ${is}`} during the run ` +
+             `and could not be put back: ${error.message}`);
+      }
+      // What used to be a real directory here is gone, so nothing beneath it can be put back.
+      if (before === 'other') break;
+    }
+    // A link further along the chain is not in the snapshot, so the end result is compared too.
+    let now = null;
+    try { now = realpathSync(from); } catch { /* resolves to nothing */ }
+    if (target !== null && now !== target) {
+      warn(`--allow-symlink ${link} led to ${target} at launch and now leads to ${now ?? 'nothing'}; ` +
+           'check it before the next run');
+    }
+  }
+}
+
+// Symlinks under roots that were created or replaced since the given time and lead
+// somewhere the program was not allowed to go. The sandbox does not follow them, but
+// whatever handles the directory next might.
+function newOutsideSymlinks(roots, granted, since, skip) {
+  const found = [];
+  const stack = roots.filter((root) => !roots.some((other) => other !== root && isWithin(root, other)));
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(p);
+      if (!entry.isSymbolicLink() || skip.has(p)) continue;
+      try {
+        if (lstatSync(p).ctimeMs < since) continue;
+        const raw = readlinkSync(p);
+        const target = realOrSelf(path.resolve(dir, raw));
+        if (!granted.some((g) => isWithin(target, g))) found.push(`${p} -> ${raw}`);
+      } catch { /* gone again */ }
+    }
+  }
+  return found;
+}
+
+// Every process on the machine, by pid. withEnv adds each one's environment to "command"
+// where the system lets ps read it. Null if ps cannot be run.
+async function processTable(withEnv) {
+  let stdout;
+  try {
+    ({ stdout } = await promisify(execFile)('ps',
+      [withEnv ? 'axeww' : 'axww', '-o', 'pid=,ppid=,pgid=,lstart=,command='],
+      { maxBuffer: 64 * 1024 * 1024 }));
+  } catch {
+    return null;
+  }
+  const table = new Map();
+  for (const line of stdout.split('\n')) {
+    // lstart is five words, as in "Tue Oct 13 12:06:30 2026".
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/.exec(line);
+    if (m) {
+      table.set(Number(m[1]), { ppid: Number(m[2]), pgid: Number(m[3]), started: m[4], command: m[5] });
+    }
+  }
+  return table;
+}
+
+// Finds what the program left running after it exited, so it can be stopped: a process
+// still alive then can change things after boxed has checked them. Nothing ties an
+// orphaned process to the run that started it, so this goes on three signs:
+//   - it descends from the program, as seen by watching the process list during the run;
+//   - it carries the marker boxed put in the program's environment;
+//   - it is an orphan in boxed's own process group that started during the run. This one
+//     only counts when boxed leads that group, as it does when started from an interactive
+//     shell; a group shared with whatever launched boxed holds other programs' orphans too.
+// A process that sets out to avoid all three can, so this is a clean-up and not a guarantee.
+function watchProcesses(rootPid, marker, since) {
+  const tracked = new Map(); // pid -> start time, which tells a reused pid apart
+  let rootAlive = true;
+  let timer;
+  let polling = Promise.resolve();
+
+  function update(table) {
+    for (const [pid, started] of tracked) {
+      if (table.get(pid)?.started !== started) tracked.delete(pid);
+    }
+    const mine = table.get(process.pid);
+    for (const [pid, p] of table) {
+      if (pid === process.pid || pid === rootPid || p.ppid === process.pid) continue;
+      const orphaned = p.ppid === 1 && p.pgid === process.pid && mine?.pgid === process.pid &&
+        Date.parse(p.started) >= since;
+      if (orphaned || p.command.includes(marker)) tracked.set(pid, p.started);
+    }
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [pid, p] of table) {
+        if (tracked.has(pid) || pid === process.pid || pid === rootPid) continue;
+        if ((rootAlive && p.ppid === rootPid) || tracked.has(p.ppid)) {
+          tracked.set(pid, p.started);
+          grew = true;
+        }
+      }
+    }
+  }
+
+  function poll() {
+    polling = processTable(false).then((table) => {
+      if (table && rootAlive) update(table);
+      if (rootAlive) timer = setTimeout(poll, 500);
+    });
+  }
+  poll();
+
+  // Call once the program has exited. Resolves to the commands of the processes stopped.
+  async function stopLeftovers() {
+    rootAlive = false;
+    clearTimeout(timer);
+    await polling;
+    const stopped = new Map();
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    // One polite round with time to finish, then forced rounds for whatever is left or
+    // was started in the meantime.
+    for (let round = 0; round < 5; round++) {
+      const table = await processTable(true);
+      if (!table) break;
+      update(table);
+      if (!tracked.size) break;
+      for (const pid of tracked.keys()) {
+        stopped.set(pid, table.get(pid).command.split(' ')[0]);
+        try { process.kill(pid, round === 0 ? 'SIGTERM' : 'SIGKILL'); } catch { /* already gone */ }
+      }
+      for (let waited = 0; waited < (round === 0 ? 2000 : 500); waited += 100) {
+        await pause(100);
+        const now = await processTable(false);
+        if (now && ![...tracked].some(([pid, started]) => now.get(pid)?.started === started)) break;
+      }
+    }
+    return [...stopped].map(([pid, command]) => `${path.basename(command)} (${pid})`);
+  }
+
+  return { stopLeftovers };
 }
 
 // quote, if given, is applied to each substituted value. onMissing, if given, is called
@@ -276,7 +489,34 @@ function buildRequest(name, programArgs, flags, runDir) {
   merged.process ??= {};
   merged.process.cwd ??= cwd;
 
-  if (proxy) {
+  let activeProxy = proxy;
+  if (flags.allowPorts.length) {
+    const { egress, ingress } = merged.network ?? {};
+    if (!proxy && ingress?.hostLoopback === 'allow') {
+      console.error('boxed: warning: this config already opens every local port ' +
+                    '(network.ingress.hostLoopback); ignoring --allow-port');
+    } else {
+      if (!proxy) {
+        // The config has no proxy, so one is started for this run. It keeps what the
+        // config says about the outside world: open stays open, closed stays closed.
+        validate(file, !egress?.allow && !egress?.deny,
+          '--allow-port starts the boxed proxy, which cannot be combined with network.egress rules');
+        validate(file, merged.runtimeConfig?.networkProxy === undefined,
+          '--allow-port starts the boxed proxy, which cannot be combined with runtimeConfig.networkProxy');
+        const external = egress?.default === 'allow' ? 'allow' : 'deny';
+        activeProxy = { external };
+        if (egress) egress.default = 'deny';
+        console.error('boxed: --allow-port: network traffic goes through the boxed proxy for this run ' +
+                      `(external: ${external})`);
+      }
+      activeProxy = {
+        ...activeProxy,
+        loopbackPorts: [...new Set([...(activeProxy.loopbackPorts ?? []), ...flags.allowPorts])],
+      };
+    }
+  }
+
+  if (activeProxy) {
     // The proxy only filters what is sent through it, so any direct route the config
     // opens would go around it.
     const { egress, ingress } = merged.network ?? {};
@@ -321,6 +561,10 @@ function buildRequest(name, programArgs, flags, runDir) {
     }))];
   }
 
+  // The sandbox matches a deny against resolved paths, so one given as a symlink has to
+  // name what the link leads to as well.
+  fs.deniedPaths = [...new Set(fs.deniedPaths.flatMap((p) => [p, realOrSelf(p)]))];
+
   // Read-only grants for paths that do not exist are dropped so one config can list
   // locations for several machines. A missing read-write path is usually something the
   // program creates on first run: Seatbelt can grant it anyway, but Bubblewrap fails
@@ -341,6 +585,67 @@ function buildRequest(name, programArgs, flags, runDir) {
 
   const home = realOrSelf(os.homedir());
   const self = realOrSelf(fileURLToPath(import.meta.url));
+
+  // The sandbox checks the path a symlink resolves to, so a link inside a granted
+  // directory leads nowhere unless its target is granted too. Targets are added before
+  // the checks below so a writable one goes through them as well.
+  const watched = [];
+  const locked = [];
+  const denied = [
+    ...fs.deniedPaths,
+    ...(privateTmp ? sharedTempDirs().filter((shared) => !isWithin(cwd, shared)) : []),
+  ];
+  for (const arg of flags.allowSymlinks) {
+    const [, link, mode = 'ro'] = arg.match(/^(.*?)(?::(ro|rw))?$/s);
+    const from = path.resolve(cwd, link);
+    const snapshot = pathsBelow(cwd, from).map((p) => [p, linkState(p)]);
+    const entry = { link, from, target: null, snapshot };
+    watched.push(entry);
+    let target;
+    try {
+      target = realpathSync(from);
+    } catch {
+      console.error(`boxed: warning: --allow-symlink ${link} does not resolve to anything; skipping it`);
+      continue;
+    }
+    if (target === from) {
+      console.error(`boxed: warning: --allow-symlink ${link} is not a symlink; skipping it`);
+      continue;
+    }
+    entry.target = target;
+    if (isWithin(home, target)) {
+      die(`--allow-symlink ${link} points at ${target}, which covers your whole home directory`);
+    }
+    const within = denied.find((d) => isWithin(target, d));
+    if (within) {
+      console.error(`boxed: warning: --allow-symlink ${link}: ${target} is inside ${within}, ` +
+                    'which is denied; skipping it');
+      continue;
+    }
+    const covers = (paths) => paths.some((p) => isWithin(target, realOrSelf(p)));
+    const writable = covers(fs.readwritePaths);
+    const readonly = covers(fs.readonlyPaths);
+    // A target the config already grants is left alone: listing it read-only here would
+    // take away write access it has through readwritePaths, and a read-only grant in
+    // the config is not something a launch flag should widen.
+    let note = 'already granted';
+    if (mode === 'rw' && readonly) {
+      note = 'read-only in the config, and stays that way';
+    } else if (!writable && !readonly) {
+      fs[mode === 'rw' ? 'readwritePaths' : 'readonlyPaths'].push(target);
+      note = mode === 'rw' ? 'read-write' : 'read-only';
+    }
+    // Printed on every run, not only with --debug: the link may not lead where it did
+    // the last time this command line was used.
+    console.error(`boxed: --allow-symlink ${link} -> ${target} (${note})`);
+    // Seatbelt matches these rules against the link's own path, which stops the program
+    // replacing the link. Bubblewrap would bind the target over the link instead.
+    if (seatbelt) locked.push(...snapshot.filter(([, state]) => state.startsWith('link:')).map(([p]) => p));
+  }
+  for (const p of locked) {
+    if (!fs.readonlyPaths.includes(p)) fs.readonlyPaths.push(p);
+  }
+
   for (const p of fs.readwritePaths) {
     const real = realOrSelf(p);
     const what = real === cwd ? `the current directory (${p})` : p;
@@ -373,13 +678,21 @@ function buildRequest(name, programArgs, flags, runDir) {
     }
   }
 
-  return { request: merged, proxy };
+  // Where to look afterwards for symlinks the program left behind: what the config made
+  // writable, and not the temp directory, which is deleted anyway.
+  const scan = {
+    roots: fs.readwritePaths.filter((p) => p !== tmp).map(realOrSelf),
+    granted: [...fs.readwritePaths, ...fs.readonlyPaths].map(realOrSelf),
+    skip: new Set(watched.flatMap(({ snapshot }) => snapshot.map(([p]) => p))),
+  };
+
+  return { request: merged, proxy: activeProxy, watched, scan };
 }
 
 async function main() {
   const { flags, name, programArgs } = parseArgs(process.argv.slice(2));
   const runDir = createRunDir();
-  const { request, proxy } = buildRequest(name, programArgs, flags, runDir);
+  const { request, proxy, watched, scan } = buildRequest(name, programArgs, flags, runDir);
 
   let running;
   if (proxy) {
@@ -393,6 +706,9 @@ async function main() {
     }
     request.runtimeConfig = { ...request.runtimeConfig, networkProxy: running.url };
   }
+  // Lets boxed recognise what the program leaves running; see watchProcesses.
+  const marker = `BOXED_RUN_ID=${randomBytes(8).toString('hex')}`;
+  request.process.env.push(marker);
   const json = JSON.stringify(request, null, 2);
 
   if (flags.printConfig) {
@@ -416,11 +732,30 @@ async function main() {
   args.push('--config', requestFile);
 
   // The executor inherits our stdio, so the program talks to the terminal directly.
+  // To the second, because that is as fine as ps reports a start time.
+  const started = Math.floor(Date.now() / 1000) * 1000;
   const child = spawn(executor, args, { stdio: 'inherit' });
+  const processes = !flags.dryRun && child.pid ? watchProcesses(child.pid, marker, started) : null;
   for (const signal of ['SIGINT', 'SIGQUIT']) process.on(signal, () => {});
   for (const signal of ['SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.on('error', (error) => die(`failed to start ${executor}: ${error.message}`, 126));
-  child.on('exit', (code, signal) => {
+  child.on('exit', async (code, signal) => {
+    if (!flags.dryRun) {
+      // First, so that nothing is left to undo what the checks below put right.
+      const stopped = await processes?.stopLeftovers() ?? [];
+      if (stopped.length) {
+        console.error(`boxed: stopped ${stopped.length} process${stopped.length === 1 ? '' : 'es'} ` +
+                      `the program left running: ${stopped.slice(0, 10).join(', ')}` +
+                      (stopped.length > 10 ? ` and ${stopped.length - 10} more` : ''));
+      }
+      const planted = newOutsideSymlinks(scan.roots, scan.granted, started, scan.skip);
+      restoreSymlinks(watched);
+      if (planted.length) {
+        console.error('boxed: warning: the program left symlinks that lead outside the sandbox:');
+        for (const line of planted.slice(0, 10)) console.error(`boxed:   ${line}`);
+        if (planted.length > 10) console.error(`boxed:   and ${planted.length - 10} more`);
+      }
+    }
     process.exit(signal ? 128 + (os.constants.signals[signal] ?? 0) : code ?? 1);
   });
 }
