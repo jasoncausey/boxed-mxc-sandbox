@@ -691,6 +691,13 @@ function buildRequest(name, programArgs, flags, runDir) {
 
 async function main() {
   const { flags, name, programArgs } = parseArgs(process.argv.slice(2));
+  try {
+    process.cwd();
+  } catch {
+    // The shell is still sitting in a directory that has since been deleted, or deleted
+    // and created again under the same name.
+    die('the current directory no longer exists; cd into it again (cd "$PWD") and retry');
+  }
   const runDir = createRunDir();
   const { request, proxy, watched, scan } = buildRequest(name, programArgs, flags, runDir);
 
