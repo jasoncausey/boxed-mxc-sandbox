@@ -20,6 +20,8 @@ The first form loads `<name>.json` from the config directory: `$BOXED_CONFIG_DIR
 | `--config FILE`             | Load `FILE` instead of a named config.                                                                                                            |
 | `--allow-symlink PATH[:rw]` | Grant read access to the target of the symlink `PATH` for this run, or read-write access with `:rw` (see [Symlinks](#symlinks)). May be repeated. |
 | `--allow-port PORT`         | Let the program reach `PORT` on this machine for this run (see [Proxy](#proxy)). May be repeated.                                                 |
+| `--allow-host HOST`         | Let the program reach `HOST` for this run when the proxy otherwise keeps it off the internet (see [Host rules](#host-rules)). May be repeated.     |
+| `--deny-host HOST`          | Have the proxy refuse `HOST` for this run (see [Host rules](#host-rules)). May be repeated.                                                       |
 | `--print-config`            | Print the resolved MXC request JSON and exit.                                                                                                     |
 | `--dry-run`                 | Have MXC validate the request without running the program.                                                                                        |
 | `--debug`                   | Print the resolved request and enable MXC diagnostics.                                                                                            |
@@ -75,7 +77,7 @@ A config is an [MXC request](https://github.com/microsoft/mxc/blob/main/docs/sch
 | `command`         | Program to run. Defaults to `<name>`, or to the basename of the `--config` file without `.json`.                              |
 | `passEnv`         | Host environment variables to pass through. Replaces the default, a short list: `PATH`, `HOME`, `TERM`, `LANG` and similar.   |
 | `privateTmp`      | Give the program its own temp directory and deny the shared ones (see [Temp directory](#temp-directory)). Defaults to `true`. |
-| `proxy`           | Route the program's network traffic through a filtering proxy that `boxed` runs (see [Proxy](#proxy)). Off unless set.        |
+| `proxy`           | Route the program's network traffic through a filtering proxy that `boxed` runs, optionally limited by host (see [Proxy](#proxy)). Off unless set. |
 | `darwin`, `linux` | Request fragment merged in on that platform. Objects merge key by key, arrays concatenate, other values replace.              |
 
 Any other key under `boxed` is an error.
@@ -124,11 +126,39 @@ boxed --allow-port 8080 --allow-port 5432 opencode
 If the config has no `boxed.proxy`, the flag starts the proxy for that run and says so. `external` is then `"allow"` if the config's `network.egress.default` is `"allow"`, otherwise `"deny"`. If the config sets `hostLoopback: "allow"`, every local port is already open and the flag is ignored with a warning.
 
 - The proxy runs inside the `boxed` process, so it stops when `boxed` does, however that happens.
-- With `boxed.proxy`, `network.egress.default` must be `deny` or absent (`boxed` sets it). With either `boxed.proxy` or `--allow-port`, the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
+- With `boxed.proxy`, `network.egress.default` must be `deny` or absent (`boxed` sets it). With `boxed.proxy` or any of `--allow-port`, `--allow-host` and `--deny-host`, the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
 - Only traffic that honours the proxy variables gets through. A program that opens sockets directly, such as `ssh`, has no network.
 - The proxy does not chain to a proxy the host itself needs.
 
 See [`examples/opencode.json`](examples/opencode.json) and [`examples/opencode-locked.json`](examples/opencode-locked.json).
+
+#### Host rules
+
+`allowHosts` and `denyHosts` in `boxed.proxy` filter by destination name:
+
+```json
+"boxed": { "proxy": {
+  "allowHosts": ["api.anthropic.com", "*.githubusercontent.com", "registry.npmjs.org:443"],
+  "denyHosts": ["telemetry.example.com"]
+} }
+```
+
+- An entry is a host name or IP address, optionally followed by `:PORT`. An IPv6 address with a port goes in brackets, as in `[::1]:8080`. `*.example.com` matches every name under `example.com`, but not `example.com` itself. Case, a trailing dot and the spelling of IP addresses do not matter.
+- A host in `denyHosts` is always refused, even when it is also in `allowHosts`.
+- Once `allowHosts` has an entry, nothing else off this machine is reached, whatever `external` says. A host in it is reached even with `"external": "deny"`, so the two together mean "only these".
+- Rules match the name the program asked for, before it is looked up. A raw IP address therefore only matches an IP address entry. Under `allowHosts` it is refused, but under `denyHosts` alone it gets through. A blocklist is easy to get around (another name, an IP address, a redirect), so use `allowHosts` when it matters.
+- Only the host and port are checked. An HTTPS request reveals nothing more to the proxy, so a rule cannot name a path. A server that hosts many sites, such as a CDN, can also be asked for a different site once the connection is open.
+- Local destinations still need their port in `loopbackPorts`. Host rules do not open them.
+
+`--allow-host HOST` and `--deny-host HOST` add to these lists for one run, and accept the same forms:
+
+```
+boxed --allow-host api.openai.com opencode-locked
+boxed --deny-host '*.sentry.io' claude
+```
+
+- `--allow-host` only opens things up. If the program can already reach any host (`external` is `"allow"` and there is no `allowHosts`), the flag is ignored with a warning, rather than closing everything else.
+- Without `boxed.proxy`, either flag starts the proxy for that run, as `--allow-port` does, with `external` taken from `network.egress.default`.
 
 ### Paths and variables
 

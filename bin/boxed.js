@@ -4,7 +4,8 @@
 //   boxed [options] <name> [program args...]
 //   boxed [options] --config FILE [program args...]
 //
-// Options: --debug, --dry-run, --print-config, --allow-symlink PATH[:rw], --allow-port PORT.
+// Options: --debug, --dry-run, --print-config, --allow-symlink PATH[:rw], --allow-port PORT,
+//          --allow-host HOST, --deny-host HOST.
 //
 // Configs live in $BOXED_CONFIG_DIR, else $XDG_CONFIG_HOME/boxed, else ~/.config/boxed,
 // one file per program: <name>.json. Each file is an MXC request JSON
@@ -15,6 +16,7 @@
 // --allow-symlink PATH grants read access to whatever the symlink PATH (relative to the
 // current directory) points at, for this run only. PATH:rw grants write access as well.
 // --allow-port PORT opens one more port on this machine through the proxy, for this run only.
+// --allow-host HOST and --deny-host HOST add to the proxy's host lists for this run only.
 //
 // Each run gets a private directory under $XDG_CACHE_HOME/boxed (else ~/.cache/boxed)
 // that holds the request handed to MXC and the program's TMPDIR; it is removed on exit.
@@ -38,7 +40,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { startProxy } from '../lib/proxy.js';
+import { parseHostRule, startProxy } from '../lib/proxy.js';
 
 const DEFAULT_PASS_ENV = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM', 'TERM_PROGRAM',
@@ -53,7 +55,8 @@ function die(message, code = 2) {
 }
 
 function parseArgs(argv) {
-  const flags = { debug: false, dryRun: false, printConfig: false, config: null, allowSymlinks: [], allowPorts: [] };
+  const flags = { debug: false, dryRun: false, printConfig: false, config: null, allowSymlinks: [], allowPorts: [],
+    allowHosts: [], denyHosts: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const arg = argv[i];
@@ -76,6 +79,13 @@ function parseArgs(argv) {
       const port = /^\d+$/.test(value) ? Number(value) : NaN;
       if (!(port >= 1 && port <= 65535)) die(`--allow-port: ${JSON.stringify(value)} is not a port number`);
       flags.allowPorts.push(port);
+    }
+    else if (/^--(allow|deny)-host(=|$)/.test(arg)) {
+      const [option, inline] = arg.split(/=(.*)/s);
+      if (inline === undefined && ++i >= argv.length) die(`${option} requires a host`);
+      const value = inline ?? argv[i];
+      try { parseHostRule(value); } catch (error) { die(`${option}: ${error.message}`); }
+      (option === '--allow-host' ? flags.allowHosts : flags.denyHosts).push(value);
     }
     else if (arg === '-h' || arg === '--help') usage(0);
     else if (arg === '--') { i++; break; }
@@ -110,6 +120,11 @@ function usage(code) {
     '  --allow-port PORT',
     '                  let the program reach PORT on this machine through the boxed proxy;',
     '                  may be repeated',
+    '  --allow-host HOST',
+    '                  let the program reach HOST (or *.DOMAIN, optionally with :PORT) when the',
+    '                  boxed proxy otherwise keeps it off the internet; may be repeated',
+    '  --deny-host HOST',
+    '                  have the boxed proxy refuse HOST (same forms); may be repeated',
   ].join('\n');
   (code === 0 ? console.log : console.error)(text);
   process.exit(code);
@@ -454,7 +469,9 @@ function buildRequest(name, programArgs, flags, runDir) {
   }
   if (proxy !== undefined) {
     validate(file, isObject(proxy), '"boxed.proxy" must be an object');
-    const { loopbackPorts = [], external = 'allow', ...unknownProxy } = proxy;
+    const {
+      loopbackPorts = [], external = 'allow', allowHosts = [], denyHosts = [], ...unknownProxy
+    } = proxy;
     validate(file, !Object.keys(unknownProxy).length,
       `unknown "boxed.proxy" keys: ${Object.keys(unknownProxy).join(', ')}`);
     validate(file, Array.isArray(loopbackPorts) &&
@@ -462,6 +479,12 @@ function buildRequest(name, programArgs, flags, runDir) {
       '"boxed.proxy.loopbackPorts" must be an array of port numbers');
     validate(file, external === 'allow' || external === 'deny',
       '"boxed.proxy.external" must be "allow" or "deny"');
+    for (const [key, hosts] of Object.entries({ allowHosts, denyHosts })) {
+      validate(file, isStringArray(hosts), `"boxed.proxy.${key}" must be an array of strings`);
+      for (const host of hosts) {
+        try { parseHostRule(host); } catch (error) { die(`${file}: "boxed.proxy.${key}": ${error.message}`); }
+      }
+    }
   }
 
   const platformOverride = { darwin, linux }[process.platform];
@@ -490,36 +513,51 @@ function buildRequest(name, programArgs, flags, runDir) {
   merged.process.cwd ??= cwd;
 
   let activeProxy = proxy;
-  if (flags.allowPorts.length) {
-    const { egress, ingress } = merged.network ?? {};
-    if (!proxy && ingress?.hostLoopback === 'allow') {
-      console.error('boxed: warning: this config already opens every local port ' +
-                    '(network.ingress.hostLoopback); ignoring --allow-port');
-    } else {
-      if (!proxy) {
-        // The config has no proxy, so one is started for this run. It keeps what the
-        // config says about the outside world: open stays open, closed stays closed.
-        validate(file, !egress?.allow && !egress?.deny,
-          '--allow-port starts the boxed proxy, which cannot be combined with network.egress rules');
-        validate(file, merged.runtimeConfig?.networkProxy === undefined,
-          '--allow-port starts the boxed proxy, which cannot be combined with runtimeConfig.networkProxy');
-        const external = egress?.default === 'allow' ? 'allow' : 'deny';
-        activeProxy = { external };
-        if (egress) egress.default = 'deny';
-        console.error('boxed: --allow-port: network traffic goes through the boxed proxy for this run ' +
-                      `(external: ${external})`);
-      }
-      activeProxy = {
-        ...activeProxy,
-        loopbackPorts: [...new Set([...(activeProxy.loopbackPorts ?? []), ...flags.allowPorts])],
-      };
+  const { egress, ingress } = merged.network ?? {};
+  let { allowPorts, allowHosts } = flags;
+  if (allowPorts.length && !proxy && ingress?.hostLoopback === 'allow') {
+    console.error('boxed: warning: this config already opens every local port ' +
+                  '(network.ingress.hostLoopback); ignoring --allow-port');
+    allowPorts = [];
+  }
+  const internetOpen = proxy
+    ? (proxy.external ?? 'allow') === 'allow' && !proxy.allowHosts?.length
+    : egress?.default === 'allow';
+  if (allowHosts.length && internetOpen) {
+    console.error('boxed: warning: this config already lets the program reach any host; ignoring --allow-host');
+    allowHosts = [];
+  }
+  const used = Object.entries({
+    '--allow-port': allowPorts, '--allow-host': allowHosts, '--deny-host': flags.denyHosts,
+  }).filter(([, values]) => values.length).map(([option]) => option).join(', ');
+  if (used) {
+    if (!proxy) {
+      // The config has no proxy, so one is started for this run. It keeps what the
+      // config says about the outside world: open stays open, closed stays closed.
+      validate(file, !egress?.allow && !egress?.deny,
+        `${used} starts the boxed proxy, which cannot be combined with network.egress rules`);
+      validate(file, merged.runtimeConfig?.networkProxy === undefined,
+        `${used} starts the boxed proxy, which cannot be combined with runtimeConfig.networkProxy`);
+      validate(file, ingress?.hostLoopback !== 'allow',
+        `${used} starts the boxed proxy, which cannot be combined with network.ingress.hostLoopback "allow"`);
+      const external = egress?.default === 'allow' ? 'allow' : 'deny';
+      activeProxy = { external };
+      if (egress) egress.default = 'deny';
+      console.error(`boxed: ${used}: network traffic goes through the boxed proxy for this run ` +
+                    `(external: ${external})`);
     }
+    const union = (key, extra) => [...new Set([...(activeProxy[key] ?? []), ...extra])];
+    activeProxy = {
+      ...activeProxy,
+      loopbackPorts: union('loopbackPorts', allowPorts),
+      allowHosts: union('allowHosts', allowHosts),
+      denyHosts: union('denyHosts', flags.denyHosts),
+    };
   }
 
   if (activeProxy) {
     // The proxy only filters what is sent through it, so any direct route the config
     // opens would go around it.
-    const { egress, ingress } = merged.network ?? {};
     validate(file, merged.runtimeConfig?.networkProxy === undefined,
       '"boxed.proxy" sets runtimeConfig.networkProxy itself; remove it from the config');
     validate(file, egress?.default !== 'allow' && !egress?.allow && !egress?.deny,
