@@ -36,7 +36,7 @@ Set `BOXED_MXC_EXEC` to use an MXC executor binary other than the one shipped in
 
 ## Installation
 
-Requires Node 24+ on macOS or Linux.
+Requires Node 24+ on macOS or Linux.  **_Note_**: _Linux is untested at the moment.  If you try it out, let me know how it works (or doesn't)._
 
 Clone the repository, or download and unpack it, then install from inside it:
 
