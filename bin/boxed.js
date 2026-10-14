@@ -4,7 +4,7 @@
 //   boxed [options] <name> [program args...]
 //   boxed [options] --config FILE [program args...]
 //
-// Options: --debug, --dry-run, --print-config, --allow-symlink PATH[:rw], --allow-port PORT,
+// Options: --debug, --dry-run, --print-config, --show-config, --allow-symlink PATH[:rw], --allow-port PORT,
 //          --allow-host HOST, --deny-host HOST.
 //
 // Configs live in $BOXED_CONFIG_DIR, else $XDG_CONFIG_HOME/boxed, else ~/.config/boxed,
@@ -55,7 +55,7 @@ function die(message, code = 2) {
 }
 
 function parseArgs(argv) {
-  const flags = { debug: false, dryRun: false, printConfig: false, config: null, allowSymlinks: [], allowPorts: [],
+  const flags = { debug: false, dryRun: false, printConfig: false, showConfig: false, config: null, allowSymlinks: [], allowPorts: [],
     allowHosts: [], denyHosts: [] };
   let i = 0;
   for (; i < argv.length; i++) {
@@ -63,6 +63,7 @@ function parseArgs(argv) {
     if (arg === '--debug') flags.debug = true;
     else if (arg === '--dry-run') flags.dryRun = true;
     else if (arg === '--print-config') flags.printConfig = true;
+    else if (arg === '--show-config') flags.showConfig = true;
     else if (arg === '--config') {
       if (++i >= argv.length) die('--config requires a file path');
       flags.config = argv[i];
@@ -112,6 +113,7 @@ function usage(code) {
     '  --debug         print the resolved request and enable MXC diagnostics (generated profile, etc.)',
     '  --dry-run       have MXC validate the request without running the program',
     '  --print-config  print the resolved MXC request JSON and exit',
+    '  --show-config   summarise what the program would be allowed to do, and exit',
     '  --config FILE   load FILE instead of a named config; the program to run defaults to',
     '                  FILE\'s basename, and program args starting with "-" go after "--"',
     '  --allow-symlink PATH[:rw]',
@@ -577,11 +579,14 @@ function buildRequest(name, programArgs, flags, runDir) {
   for (const key of passEnv) {
     if (process.env[key] !== undefined) env.set(key, process.env[key]);
   }
+  const hostEnv = [...env.keys()].filter((key) => !(privateTmp && key === 'TMPDIR'));
   if (privateTmp) env.set('TMPDIR', tmp);
+  const configEnv = [];
   for (const entry of merged.process.env ?? []) {
     const eq = entry.indexOf('=');
     if (eq < 1) die(`${file}: process.env entries must be "KEY=VALUE", got ${JSON.stringify(entry)}`);
     env.set(entry.slice(0, eq), entry.slice(eq + 1));
+    configEnv.push(entry.slice(0, eq));
   }
   merged.process.env = [...env].map(([key, value]) => `${key}=${value}`);
 
@@ -724,7 +729,73 @@ function buildRequest(name, programArgs, flags, runDir) {
     skip: new Set(watched.flatMap(({ snapshot }) => snapshot.map(([p]) => p))),
   };
 
-  return { request: merged, proxy: activeProxy, watched, scan };
+  const summary = { file, privateTmp, tmp, hostEnv, configEnv };
+  return { request: merged, proxy: activeProxy, watched, scan, summary };
+}
+
+// The --show-config view: what the program may touch, in words, with the request's
+// remaining MXC settings listed as they are. Variable values are left out because they
+// can hold secrets.
+function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv }) {
+  const home = os.homedir();
+  const tilde = (p) => (isWithin(p, home) && p !== home ? `~/${path.relative(home, p)}` : p);
+  const lines = [];
+  const row = (label, values) => {
+    const list = [values].flat();
+    if (!list.length) list.push('(none)');
+    list.forEach((value, i) => lines.push(`  ${(i ? '' : label).padEnd(13)}${value}`));
+  };
+
+  const { version, containment, filesystem: fs, network = {}, process: proc, runtimeConfig, ...other } = request;
+  lines.push('program');
+  row('config', tilde(file));
+  row('command', proc.commandLine);
+  row('directory', tilde(proc.cwd));
+
+  lines.push('', 'filesystem');
+  row('read-write', fs.readwritePaths.map((p) => {
+    if (privateTmp && p === tmp) {
+      return `${path.join(tilde(path.dirname(path.dirname(p))), 'run-*', 'tmp')}  (private temp directory, new for each run)`;
+    }
+    return existsSync(p) ? tilde(p) : `${tilde(p)}  (does not exist yet)`;
+  }));
+  row('read-only', fs.readonlyPaths.map((p) => (existsSync(p) ? tilde(p) : `${tilde(p)}  (does not exist, and cannot be created)`)));
+  row('denied', fs.deniedPaths.map(tilde));
+  const { readwritePaths, readonlyPaths, deniedPaths, ...otherFs } = fs;
+  if (Object.keys(otherFs).length) row('other', JSON.stringify(otherFs));
+
+  lines.push('', 'network');
+  const { egress = {}, ingress = {}, ...otherNet } = network;
+  if (proxy) {
+    const external = proxy.external ?? 'allow';
+    row('route', 'only through the boxed proxy, for programs that honour HTTP_PROXY');
+    if (proxy.allowHosts?.length) row('internet', proxy.allowHosts.map((h, i) => (i ? h : `only ${h}`)));
+    else row('internet', external === 'allow' ? 'any host' : 'none');
+    if (proxy.denyHosts?.length) row('blocked', proxy.denyHosts);
+    row('local', proxy.loopbackPorts?.length ? `ports ${proxy.loopbackPorts.join(', ')}` : 'none');
+  } else {
+    const { default: egressDefault = 'deny', ...egressRules } = egress;
+    row('internet', egressDefault === 'allow' ? 'any host' : 'none');
+    if (Object.keys(egressRules).length) row('rules', JSON.stringify(egressRules));
+    row('local', ingress.hostLoopback === 'allow' ? 'every port' : 'none');
+  }
+  const { hostLoopback, ...otherIngress } = ingress;
+  if (Object.keys(otherIngress).length) row('ingress', JSON.stringify(otherIngress));
+  if (Object.keys(otherNet).length) row('other', JSON.stringify(otherNet));
+
+  lines.push('', 'environment (names only)');
+  row('from host', hostEnv.join(' ') || []);
+  row('from config', configEnv.join(' ') || []);
+  row('TMPDIR', privateTmp ? 'the private temp directory' : `${tilde(tmp)} (shared with the host)`);
+
+  const { commandLine, cwd, env, ...otherProc } = proc;
+  const rest = Object.entries({
+    containment, ...other, ...(Object.keys(otherProc).length ? { process: otherProc } : {}),
+    ...(runtimeConfig ? { runtimeConfig } : {}),
+  });
+  lines.push('', 'other MXC settings');
+  for (const [key, value] of rest) row(key, typeof value === 'string' ? value : JSON.stringify(value));
+  console.log(lines.join('\n'));
 }
 
 async function main() {
@@ -737,7 +808,11 @@ async function main() {
     die('the current directory no longer exists; cd into it again (cd "$PWD") and retry');
   }
   const runDir = createRunDir();
-  const { request, proxy, watched, scan } = buildRequest(name, programArgs, flags, runDir);
+  const { request, proxy, watched, scan, summary } = buildRequest(name, programArgs, flags, runDir);
+  if (flags.showConfig) {
+    showConfig(request, proxy, summary);
+    return;
+  }
 
   let running;
   if (proxy) {

@@ -23,6 +23,7 @@ The first form loads `<name>.json` from the config directory: `$BOXED_CONFIG_DIR
 | `--allow-host HOST`         | Let the program reach `HOST` for this run when the proxy otherwise keeps it off the internet (see [Host rules](#host-rules)). May be repeated.     |
 | `--deny-host HOST`          | Have the proxy refuse `HOST` for this run (see [Host rules](#host-rules)). May be repeated.                                                       |
 | `--print-config`            | Print the resolved MXC request JSON and exit.                                                                                                     |
+| `--show-config`             | Summarise what the program would be allowed to read, write and reach, and exit (see [Checking a config](#checking-a-config)).                     |
 | `--dry-run`                 | Have MXC validate the request without running the program.                                                                                        |
 | `--debug`                   | Print the resolved request and enable MXC diagnostics.                                                                                            |
 | `-h`, `--help`              | Print the usage summary and exit.                                                                                                                 |
@@ -50,6 +51,40 @@ npm link
 ```
 
 `npm install` fetches the dependencies. `npm link` puts the `boxed` command on your `PATH`; without it, run `bin/boxed.js` directly.
+
+### Checking a config
+
+`--show-config` prints what a run would allow, after platform overrides, variable expansion and any `--allow-*` or `--deny-host` flags have been applied. It exits without starting the program:
+
+```
+$ boxed --show-config --allow-port 8080 opencode-locked
+program
+  config       ~/.config/boxed/opencode-locked.json
+  command      exec opencode
+  directory    ~/src/project
+
+filesystem
+  read-write   ~/src/project
+               ~/.config/opencode
+               ~/.cache/boxed/run-*/tmp  (private temp directory, new for each run)
+  read-only    ~/.gitconfig
+               ~/.config/opencode/AGENTS.md  (does not exist, and cannot be created)
+  denied       ~/.ssh
+               /private/tmp
+
+network
+  route        only through the boxed proxy, for programs that honour HTTP_PROXY
+  internet     none
+  local        ports 11434, 8080
+
+environment (names only)
+  from host    PATH HOME USER LOGNAME SHELL TERM LANG
+  from config  OPENCODE_DISABLE_AUTOUPDATE
+  TMPDIR       the private temp directory
+...
+```
+
+Environment variables are listed by name only, since their values can be secrets. MXC settings that `boxed` does not interpret, such as `seatbelt`, are listed as they are at the end. `--print-config` shows the full request as JSON instead.
 
 ## Config format
 
