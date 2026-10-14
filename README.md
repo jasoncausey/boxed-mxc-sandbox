@@ -2,12 +2,6 @@
 
 Run a program inside an [MXC](https://github.com/microsoft/mxc) sandbox using a stored per-program config.
 
-Requires Node 24+ on macOS or Linux.
-
-```
-npm install
-```
-
 ## Usage
 
 ```
@@ -15,16 +9,17 @@ boxed [options] <name> [program args...]
 boxed [options] --config FILE [program args...]
 ```
 
-The first form loads `<name>.json` from the config directory. The second loads `FILE` directly and takes no `<name>`.
+The first form loads `<name>.json` from the config directory: `$BOXED_CONFIG_DIR`, else `$XDG_CONFIG_HOME/boxed`, else `~/.config/boxed`. The second loads `FILE` directly and takes no `<name>`.
 
-| Option | Effect |
-| --- | --- |
-| `--config FILE` | Load `FILE` instead of a named config. |
-| `--allow-symlink PATH[:rw]` | Grant read access to the target of the symlink `PATH` for this run, or read-write access with `:rw` (see below). May be repeated. |
-| `--allow-port PORT` | Let the program reach `PORT` on this machine for this run (see [Proxy](#proxy)). May be repeated. |
-| `--print-config` | Print the resolved MXC request JSON and exit. |
-| `--dry-run` | Have MXC validate the request without running the program. |
-| `--debug` | Print the resolved request and enable MXC diagnostics. |
+| Option                      | Effect                                                                                                                                            |
+|-----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--config FILE`             | Load `FILE` instead of a named config.                                                                                                            |
+| `--allow-symlink PATH[:rw]` | Grant read access to the target of the symlink `PATH` for this run, or read-write access with `:rw` (see [Symlinks](#symlinks)). May be repeated. |
+| `--allow-port PORT`         | Let the program reach `PORT` on this machine for this run (see [Proxy](#proxy)). May be repeated.                                                 |
+| `--print-config`            | Print the resolved MXC request JSON and exit.                                                                                                     |
+| `--dry-run`                 | Have MXC validate the request without running the program.                                                                                        |
+| `--debug`                   | Print the resolved request and enable MXC diagnostics.                                                                                            |
+| `-h`, `--help`              | Print the usage summary and exit.                                                                                                                 |
 
 Options go before `<name>`. With `--config`, put program args that start with `-` after `--`:
 
@@ -33,9 +28,22 @@ boxed claude -p 'hello'
 boxed --config examples/claude.json -- -p 'hello'
 ```
 
-The config directory is `$BOXED_CONFIG_DIR`, else `$XDG_CONFIG_HOME/boxed`, else `~/.config/boxed`.
-
 Set `BOXED_MXC_EXEC` to use an MXC executor binary other than the one shipped in `@microsoft/mxc-sdk`.
+
+## Installation
+
+Requires Node 24+ on macOS or Linux.
+
+Clone the repository, or download and unpack it, then install from inside it:
+
+```
+git clone <repo-url> boxed
+cd boxed
+npm install
+npm link
+```
+
+`npm install` fetches the dependencies. `npm link` puts the `boxed` command on your `PATH`; without it, run `bin/boxed.js` directly.
 
 ## Config format
 
@@ -58,15 +66,17 @@ A config is an [MXC request](https://github.com/microsoft/mxc/blob/main/docs/sch
 
 ### The `boxed` key
 
-| Key | Meaning |
-| --- | --- |
-| `command` | Program to run. Defaults to `<name>`, or to the basename of the `--config` file without `.json`. |
-| `passEnv` | Host environment variables to pass through. Defaults to a short list: `PATH`, `HOME`, `TERM`, `LANG` and similar. |
-| `privateTmp` | Give the program its own temp directory and deny the shared ones (see below). Defaults to `true`. |
-| `proxy` | Route the program's network traffic through a filtering proxy that `boxed` runs (see below). Off unless set. |
-| `darwin`, `linux` | Request fragment merged in on that platform. Objects merge key by key, arrays concatenate, other values replace. |
+| Key               | Meaning                                                                                                                       |
+|-------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `command`         | Program to run. Defaults to `<name>`, or to the basename of the `--config` file without `.json`.                              |
+| `passEnv`         | Host environment variables to pass through. Replaces the default, a short list: `PATH`, `HOME`, `TERM`, `LANG` and similar.   |
+| `privateTmp`      | Give the program its own temp directory and deny the shared ones (see [Temp directory](#temp-directory)). Defaults to `true`. |
+| `proxy`           | Route the program's network traffic through a filtering proxy that `boxed` runs (see [Proxy](#proxy)). Off unless set.        |
+| `darwin`, `linux` | Request fragment merged in on that platform. Objects merge key by key, arrays concatenate, other values replace.              |
 
-### What boxed fills in
+Any other key under `boxed` is an error.
+
+### What `boxed` fills in
 
 - `version` defaults to `1.0.0`, `containment` to `process`, and `process.cwd` to the current directory.
 - `process.commandLine` defaults to `exec <command> <program args>`. If you set it, the program args are appended to it.
@@ -76,7 +86,7 @@ A config is an [MXC request](https://github.com/microsoft/mxc/blob/main/docs/sch
 
 Each run gets a private directory under `$XDG_CACHE_HOME/boxed` (else `~/.cache/boxed`), removed when the program exits. Its `tmp` subdirectory is granted read-write, `TMPDIR` is set to it, and `${TMPDIR}` in the config expands to it.
 
-The shared temp directories (`/tmp`, `/var/tmp` and the host's own `$TMPDIR`) are added to `deniedPaths`. Other programs keep sockets there, such as tmux, editors and ssh-askpass, and a sandboxed program that can connect to one of those can run commands outside the sandbox. A deny wins over a grant, so listing `/tmp` in `readwritePaths` has no effect. If the current directory is itself inside a shared temp directory, that one is left open and `boxed` warns.
+The shared temp directories (`/tmp`, `/var/tmp` and the host's own `$TMPDIR`) are added to `deniedPaths`. Other programs keep sockets there, such as tmux, editors and ssh-askpass, and a sandboxed program that can connect to one can run commands outside the sandbox. A deny wins over a grant, so listing `/tmp` in `readwritePaths` has no effect. If the current directory is itself inside a shared temp directory, that one is left open and `boxed` warns.
 
 A program that hardcodes `/tmp` needs to be told where to write instead. For Claude Code that is `CLAUDE_CODE_TMPDIR`, which the example config sets.
 
@@ -84,7 +94,7 @@ A program that hardcodes `/tmp` needs to be told where to write instead. For Cla
 
 ### Proxy
 
-MXC's `network.ingress.hostLoopback` opens every port on localhost or none, and on macOS it also has to open inbound connections. `boxed.proxy` is for a program that needs one local service, such as a model server, and the internet:
+MXC's `network.ingress.hostLoopback` opens every port on localhost or none, and on macOS it also has to open inbound connections. `boxed.proxy` is for a program that needs one local service, such as a model server (e.g. Ollama), and the internet:
 
 ```json
 "network": { "egress": { "default": "deny" } },
@@ -107,10 +117,10 @@ A hostname is then refused without being looked up, since the lookup would itsel
 boxed --allow-port 8080 --allow-port 5432 opencode
 ```
 
-If the config has no `boxed.proxy`, the flag starts the proxy for that run and says so. `external` then follows the config's `network.egress.default`: `"allow"` if that is `"allow"`, otherwise `"deny"`. A config that sets `network.egress` rules cannot be used with the flag, and one that sets `hostLoopback: "allow"` already opens every local port, so the flag is ignored with a warning.
+If the config has no `boxed.proxy`, the flag starts the proxy for that run and says so. `external` is then `"allow"` if the config's `network.egress.default` is `"allow"`, otherwise `"deny"`. If the config sets `hostLoopback: "allow"`, every local port is already open and the flag is ignored with a warning.
 
 - The proxy runs inside the `boxed` process, so it stops when `boxed` does, however that happens.
-- `network.egress.default` must be `deny` or absent (`boxed` sets it), and the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
+- With `boxed.proxy`, `network.egress.default` must be `deny` or absent (`boxed` sets it). With either `boxed.proxy` or `--allow-port`, the config cannot also set `egress` rules, `hostLoopback: "allow"` or `runtimeConfig.networkProxy`.
 - Only traffic that honours the proxy variables gets through. A program that opens sockets directly, such as `ssh`, has no network.
 - The proxy does not chain to a proxy the host itself needs.
 
@@ -118,7 +128,7 @@ See [`examples/opencode.json`](examples/opencode.json) and [`examples/opencode-l
 
 ### Paths and variables
 
-- `${CWD}`, `${HOME}` and `${TMPDIR}` expand in any string, and `${env:NAME}` expands to that host environment variable (empty if unset).
+- `${CWD}`, `${HOME}` and `${TMPDIR}` expand in any string of the request, and `${env:NAME}` expands to that host environment variable (empty if unset). They are not expanded in `boxed.command` or `boxed.passEnv`.
 - In `process.commandLine` each expanded value is shell-quoted, so write `cd ${CWD}`, not `cd "${CWD}"`.
 - A leading `~/` expands in `filesystem` path lists.
 - A `deniedPaths` entry that is a symlink is denied at the path it leads to as well.
@@ -138,22 +148,21 @@ boxed --allow-symlink data --allow-symlink out/:rw omp
 
 - `PATH` is relative to the current directory. It can be the link itself or a path that goes through one, such as `data/2024/report.csv`, which grants only that file.
 - The target is granted read-only. Add `:rw` to make it writable, as in `out/:rw`. `:ro` spells out the default, which is the way to name a link that itself ends in `:rw`.
-- A target already covered by the config keeps the access it has there. In particular `:rw` does not make a `readonlyPaths` entry writable; `boxed` warns and leaves it read-only.
+- A target already covered by the config keeps the access it has there. In particular `:rw` does not make a `readonlyPaths` entry writable.
 - A writable target gets the same checks as `readwritePaths`: `boxed` warns if it contains the config file or `boxed` itself.
-- A path that does not exist or is not a symlink is skipped with a warning, so the same command line works in projects that lack the link.
+- A path that does not exist or is not a symlink is skipped with a warning, so the same command line works in projects that lack the link. So is a target inside a `deniedPaths` entry or a shared temp directory.
 - `boxed` refuses a link whose target covers your home directory. `deniedPaths` still win over the grant.
 - Symlinks inside the target that lead somewhere else are not followed; name those too.
-- A target inside a `deniedPaths` entry or a shared temp directory is skipped with a warning.
 
 The link sits in a directory the program can write to, so the program could point it somewhere else and wait for your next run to grant that. `boxed` guards against this in three ways:
 
-- Every run prints where each link leads and what was granted, so a change is visible before the program starts.
-- On macOS the link itself is read-only inside the sandbox and cannot be removed, renamed or replaced. A link in a subdirectory is only protected this far: the directories above it can still be moved.
-- When the program exits, `boxed` compares the link and each directory on the way to it with how they were at launch. A link that was changed or removed is put back, and a link that appeared where there was none is removed, each with a warning. If the path leads somewhere new because of a link further along the chain, `boxed` warns and leaves it to you.
+1. Every run prints where each link leads and what was granted, so a change is visible before the program starts.
+2. On macOS the link itself is read-only inside the sandbox and cannot be removed, renamed or replaced. A link in a subdirectory is only protected this far: the directories above it can still be moved.
+3. When the program exits, `boxed` compares the link and each directory on the way to it with how they were at launch. A link that was changed or removed is put back, and a link that appeared where there was none is removed, each with a warning. A link replaced by a file or directory, or a path that leads somewhere new because of a link further along the chain, gets a warning and is left to you.
 
-The check at exit is the only one of the last two on Linux. A process that survives the clean-up described under [Leftover processes](#leftover-processes) is still sandboxed but can change a link after the check, so read the line printed at launch.
+Linux has no equivalent of the second. A process that survives the clean-up described under [Leftover processes](#leftover-processes) is still sandboxed but can change a link after the check at exit, so read the line printed at launch.
 
-After every run, with or without `--allow-symlink`, `boxed` also walks the writable paths from the config and lists symlinks created during the run that lead somewhere the program had no access to. The sandbox does not follow these, but a tool you run on the directory afterwards might. They are reported, not removed. `--dry-run` skips these checks.
+After every run, with or without `--allow-symlink`, `boxed` also walks the writable paths and lists symlinks created during the run that lead somewhere the program had no access to. The sandbox does not follow these, but a tool you run on the directory afterwards might. They are reported, not removed. `--dry-run` skips these checks.
 
 ### Leftover processes
 
