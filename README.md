@@ -84,7 +84,7 @@ environment (names only)
 ...
 ```
 
-Environment variables are listed by name only, since their values can be secrets. MXC settings that `boxed` does not interpret, such as `seatbelt`, are listed as they are at the end. `--print-config` shows the full request as JSON instead.
+Environment variables are listed by name only, since their values can be secrets. For the same reason `${env:NAME}` is shown as written in the command and in other settings; filesystem paths and the directory are shown expanded. MXC settings that `boxed` does not interpret, such as `seatbelt`, are listed as they are at the end. `--print-config` shows the full request as JSON instead.
 
 ## Config format
 

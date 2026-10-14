@@ -358,14 +358,16 @@ function watchProcesses(rootPid, marker, since) {
 
 // quote, if given, is applied to each substituted value. onMissing, if given, is called
 // for a variable with no value; otherwise ${env:NAME} becomes empty and ${NAME} is left alone.
-function expand(value, vars, { quote, onMissing } = {}) {
-  if (Array.isArray(value)) return value.map((v) => expand(v, vars, { quote, onMissing }));
+// keepEnv leaves ${env:NAME} as it is, for showing a request without its secrets.
+function expand(value, vars, { quote, onMissing, keepEnv } = {}) {
+  if (Array.isArray(value)) return value.map((v) => expand(v, vars, { quote, onMissing, keepEnv }));
   if (isObject(value)) {
     return Object.fromEntries(
-      Object.entries(value).map(([k, v]) => [k, expand(v, vars, { quote, onMissing })]));
+      Object.entries(value).map(([k, v]) => [k, expand(v, vars, { quote, onMissing, keepEnv })]));
   }
   if (typeof value !== 'string') return value;
   return value.replace(/\$\{(env:)?([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, isEnv, key) => {
+    if (isEnv && keepEnv) return match;
     const found = isEnv ? process.env[key] : (Object.hasOwn(vars, key) ? vars[key] : undefined);
     if (found === undefined) return onMissing ? onMissing(match) : (isEnv ? '' : match);
     return quote ? quote(found) : found;
@@ -570,9 +572,15 @@ function buildRequest(name, programArgs, flags, runDir) {
   }
 
   const argv = programArgs.map(shellQuote).join(' ');
-  merged.process.commandLine = merged.process.commandLine
-    ? [merged.process.commandLine, argv].filter(Boolean).join(' ')
-    : ['exec', shellQuote(command), argv].filter(Boolean).join(' ');
+  const withArgs = (line) => (line
+    ? [line, argv].filter(Boolean).join(' ')
+    : ['exec', shellQuote(command), argv].filter(Boolean).join(' '));
+  merged.process.commandLine = withArgs(merged.process.commandLine);
+  // What --show-config prints of the request as written: ${env:NAME} stays as it is,
+  // since its value can be a secret.
+  const shown = expand(raw, vars, { keepEnv: true });
+  const shownCommandLine = withArgs(raw.process?.commandLine &&
+    expand(raw.process.commandLine, vars, { quote: shellQuote, keepEnv: true }));
 
   // MXC never inherits the host environment, so pass through an explicit allowlist.
   const env = new Map();
@@ -729,14 +737,15 @@ function buildRequest(name, programArgs, flags, runDir) {
     skip: new Set(watched.flatMap(({ snapshot }) => snapshot.map(([p]) => p))),
   };
 
-  const summary = { file, privateTmp, tmp, hostEnv, configEnv };
+  const summary = { file, privateTmp, tmp, hostEnv, configEnv, shown, shownCommandLine };
   return { request: merged, proxy: activeProxy, watched, scan, summary };
 }
 
 // The --show-config view: what the program may touch, in words, with the request's
 // remaining MXC settings listed as they are. Variable values are left out because they
-// can hold secrets.
-function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv }) {
+// can hold secrets: process.env is listed by name, and elsewhere ${env:NAME} is printed
+// unexpanded. Paths are the exception, since what they lead to is the point.
+function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv, shown, shownCommandLine }) {
   const home = os.homedir();
   const tilde = (p) => (isWithin(p, home) && p !== home ? `~/${path.relative(home, p)}` : p);
   const lines = [];
@@ -746,10 +755,14 @@ function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv 
     list.forEach((value, i) => lines.push(`  ${(i ? '' : label).padEnd(13)}${value}`));
   };
 
-  const { version, containment, filesystem: fs, network = {}, process: proc, runtimeConfig, ...other } = request;
+  const { filesystem: fs, network = {}, process: proc } = request;
+  const {
+    version, containment = 'process', filesystem: shownFs = {}, network: shownNet = {},
+    process: shownProc = {}, runtimeConfig, ...other
+  } = shown;
   lines.push('program');
   row('config', tilde(file));
-  row('command', proc.commandLine);
+  row('command', shownCommandLine);
   row('directory', tilde(proc.cwd));
 
   lines.push('', 'filesystem');
@@ -761,11 +774,12 @@ function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv 
   }));
   row('read-only', fs.readonlyPaths.map((p) => (existsSync(p) ? tilde(p) : `${tilde(p)}  (does not exist, and cannot be created)`)));
   row('denied', fs.deniedPaths.map(tilde));
-  const { readwritePaths, readonlyPaths, deniedPaths, ...otherFs } = fs;
+  const { readwritePaths, readonlyPaths, deniedPaths, ...otherFs } = shownFs;
   if (Object.keys(otherFs).length) row('other', JSON.stringify(otherFs));
 
   lines.push('', 'network');
-  const { egress = {}, ingress = {}, ...otherNet } = network;
+  const { egress = {}, ingress = {} } = network;
+  const { egress: shownEgress = {}, ingress: shownIngress = {}, ...otherNet } = shownNet;
   if (proxy) {
     const external = proxy.external ?? 'allow';
     row('route', 'only through the boxed proxy, for programs that honour HTTP_PROXY');
@@ -774,12 +788,13 @@ function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv 
     if (proxy.denyHosts?.length) row('blocked', proxy.denyHosts);
     row('local', proxy.loopbackPorts?.length ? `ports ${proxy.loopbackPorts.join(', ')}` : 'none');
   } else {
-    const { default: egressDefault = 'deny', ...egressRules } = egress;
+    const { default: egressDefault = 'deny' } = egress;
+    const { default: _, ...egressRules } = shownEgress;
     row('internet', egressDefault === 'allow' ? 'any host' : 'none');
     if (Object.keys(egressRules).length) row('rules', JSON.stringify(egressRules));
     row('local', ingress.hostLoopback === 'allow' ? 'every port' : 'none');
   }
-  const { hostLoopback, ...otherIngress } = ingress;
+  const { hostLoopback, ...otherIngress } = shownIngress;
   if (Object.keys(otherIngress).length) row('ingress', JSON.stringify(otherIngress));
   if (Object.keys(otherNet).length) row('other', JSON.stringify(otherNet));
 
@@ -788,7 +803,7 @@ function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv 
   row('from config', configEnv.join(' ') || []);
   row('TMPDIR', privateTmp ? 'the private temp directory' : `${tilde(tmp)} (shared with the host)`);
 
-  const { commandLine, cwd, env, ...otherProc } = proc;
+  const { commandLine, cwd, env, ...otherProc } = shownProc;
   const rest = Object.entries({
     containment, ...other, ...(Object.keys(otherProc).length ? { process: otherProc } : {}),
     ...(runtimeConfig ? { runtimeConfig } : {}),
