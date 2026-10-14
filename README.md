@@ -80,6 +80,8 @@ network
 environment (names only)
   from host    PATH HOME USER LOGNAME SHELL TERM LANG
   from config  OPENCODE_DISABLE_AUTOUPDATE
+  from boxed   BOXED_RUN_ID (identifies this run)
+               HTTP_PROXY HTTPS_PROXY ALL_PROXY (the boxed proxy, set by MXC)
   TMPDIR       the private temp directory
 ...
 ```
@@ -182,7 +184,7 @@ See [`examples/opencode.json`](examples/opencode.json) and [`examples/opencode-l
 - A host in `denyHosts` is always refused, even when it is also in `allowHosts`.
 - Once `allowHosts` has an entry, nothing else off this machine is reached, whatever `external` says. A host in it is reached even with `"external": "deny"`, so the two together mean "only these".
 - Rules match the name the program asked for, before it is looked up. A raw IP address therefore only matches an IP address entry. Under `allowHosts` it is refused, but under `denyHosts` alone it gets through. A blocklist is easy to get around (another name, an IP address, a redirect), so use `allowHosts` when it matters.
-- Only the host and port are checked. An HTTPS request reveals nothing more to the proxy, so a rule cannot name a path. A server that hosts many sites, such as a CDN, can also be asked for a different site once the connection is open.
+- Only the host and port are checked. An HTTPS request reveals nothing more to the proxy, so a rule cannot name a path. A server that hosts many sites, such as a CDN, can also be asked for a different site once an HTTPS connection is open. A plain HTTP request is always sent with the host that was checked as its `Host` header.
 - Local destinations still need their port in `loopbackPorts`. Host rules do not open them.
 
 `--allow-host HOST` and `--deny-host HOST` add to these lists for one run, and accept the same forms:

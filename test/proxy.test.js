@@ -3,6 +3,7 @@
 
 import assert from 'node:assert/strict';
 import dns from 'node:dns/promises';
+import http from 'node:http';
 import net from 'node:net';
 import { after, before, beforeEach, describe, test } from 'node:test';
 
@@ -31,6 +32,7 @@ describe('proxy host rules', () => {
   const realLookup = dns.lookup;
   let lookups;
   let target;
+  let echo;
   let proxy;
   let proxyPort;
 
@@ -41,8 +43,11 @@ describe('proxy host rules', () => {
     };
     target = net.createServer((socket) => socket.end());
     await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve));
+    // Answers with the Host header it was sent.
+    echo = http.createServer((req, res) => res.end(req.headers.host));
+    await new Promise((resolve) => echo.listen(0, '127.0.0.1', resolve));
     proxy = await startProxy({
-      external: 'deny', loopbackPorts: [target.address().port],
+      external: 'deny', loopbackPorts: [target.address().port, echo.address().port],
       allowHosts: ['example.com', '*.allowed.test'], denyHosts: ['blocked.allowed.test'],
     });
     proxyPort = Number(new URL(proxy.url).port);
@@ -52,6 +57,7 @@ describe('proxy host rules', () => {
     dns.lookup = realLookup;
     proxy.close();
     target.close();
+    echo.close();
   });
 
   beforeEach(() => { lookups = []; });
@@ -94,4 +100,19 @@ describe('proxy host rules', () => {
       assert.deepEqual(lookups, [], 'the name went to DNS');
     });
   }
+
+  test('sends a plain HTTP request with the checked host as its Host header', async () => {
+    const port = echo.address().port;
+    const body = await new Promise((resolve, reject) => {
+      http.get({
+        host: '127.0.0.1', port: proxyPort, path: `http://example.com:${port}/`,
+        headers: { host: 'evil.test' }, agent: false,
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => resolve(`${res.statusCode} ${data}`));
+      }).on('error', reject);
+    });
+    assert.equal(body, `200 example.com:${port}`);
+  });
 });

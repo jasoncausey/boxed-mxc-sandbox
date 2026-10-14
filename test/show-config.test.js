@@ -42,3 +42,13 @@ test('still expands the other variables', () => {
   const output = showConfig({ process: { commandLine: 'cd ${CWD} && exec true' } });
   assert.match(output, new RegExp(`command +cd ${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
 });
+
+test('lists each variable once, where its value comes from', () => {
+  const output = showConfig({
+    process: { env: ['HOME=/elsewhere', 'EXTRA=1'] },
+    boxed: { proxy: { loopbackPorts: [11434] } },
+  });
+  assert.match(output, /from host +PATH\n/);
+  assert.match(output, /from config +HOME EXTRA\n/);
+  assert.match(output, /from boxed +BOXED_RUN_ID .*\n +HTTP_PROXY HTTPS_PROXY ALL_PROXY /);
+});

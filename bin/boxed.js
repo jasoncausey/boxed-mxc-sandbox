@@ -589,12 +589,12 @@ function buildRequest(name, programArgs, flags, runDir) {
   }
   const hostEnv = [...env.keys()].filter((key) => !(privateTmp && key === 'TMPDIR'));
   if (privateTmp) env.set('TMPDIR', tmp);
-  const configEnv = [];
+  const configEnv = new Set();
   for (const entry of merged.process.env ?? []) {
     const eq = entry.indexOf('=');
     if (eq < 1) die(`${file}: process.env entries must be "KEY=VALUE", got ${JSON.stringify(entry)}`);
     env.set(entry.slice(0, eq), entry.slice(eq + 1));
-    configEnv.push(entry.slice(0, eq));
+    configEnv.add(entry.slice(0, eq));
   }
   merged.process.env = [...env].map(([key, value]) => `${key}=${value}`);
 
@@ -799,9 +799,14 @@ function showConfig(request, proxy, { file, privateTmp, tmp, hostEnv, configEnv,
   if (Object.keys(otherNet).length) row('other', JSON.stringify(otherNet));
 
   lines.push('', 'environment (names only)');
-  row('from host', hostEnv.join(' ') || []);
-  row('from config', configEnv.join(' ') || []);
-  row('TMPDIR', privateTmp ? 'the private temp directory' : `${tilde(tmp)} (shared with the host)`);
+  // A config entry replaces the host's value, so each name is listed where it comes from.
+  row('from host', hostEnv.filter((key) => !configEnv.has(key)).join(' ') || []);
+  row('from config', [...configEnv].join(' ') || []);
+  row('from boxed', ['BOXED_RUN_ID (identifies this run)',
+    ...(proxy ? ['HTTP_PROXY HTTPS_PROXY ALL_PROXY (the boxed proxy, set by MXC)'] : [])]);
+  if (!configEnv.has('TMPDIR')) {
+    row('TMPDIR', privateTmp ? 'the private temp directory' : `${tilde(tmp)} (shared with the host)`);
+  }
 
   const { commandLine, cwd, env, ...otherProc } = shownProc;
   const rest = Object.entries({
