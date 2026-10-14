@@ -10,6 +10,9 @@
   "engines": {
     "node": ">=24"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "@microsoft/mxc-sdk": "1.0.0"
   }
