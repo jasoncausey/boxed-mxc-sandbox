@@ -2,6 +2,10 @@
 
 Run a program inside an [MXC](https://github.com/microsoft/mxc) sandbox using a stored per-program config.
 
+This was an experiment to try out MXC after it made the Hacker News front page recently.  I don't know if it is the best sandbox, but it is working well for what I needed it to do right now.
+
+I created `boxed` so I can feel more confident in using local-only models on data that must not leave my machine, and more confident in letting frontier run when they can simply bypass their own built-in sandboxes.  It isn't foolproof, but it adds an additional layer of protection between the agent and the filesystem / network.  The entire project was created and audited by LLMs, so use at your own risk (or just build your own).
+
 ## Usage
 
 ```
