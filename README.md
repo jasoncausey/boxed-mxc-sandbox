@@ -119,9 +119,9 @@ A config is an [MXC request](https://github.com/microsoft/mxc/blob/main/docs/sch
 
 Any other key under `boxed` is an error.
 
-### What `boxed` fills in
+### MXC Defaults and environment applied by `boxed`
 
-- `version` defaults to `1.0.0`, `containment` to `process`, and `process.cwd` to the current directory.
+- `version` (the MXC request schema version) defaults to `1.0.0`, `containment` to `process`, and `process.cwd` to the current directory.
 - `process.commandLine` defaults to `exec <command> <program args>`. If you set it, the program args are appended to it.
 - `process.env` entries (`"KEY=VALUE"`) are applied on top of the `passEnv` variables. Nothing else from the host environment reaches the program.
 
